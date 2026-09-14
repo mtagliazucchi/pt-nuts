@@ -409,15 +409,22 @@ def pt_nuts(
     model: A NumPyro model callable.
     model_args, model_kwargs: Positional/keyword args forwarded to `model`.
     n_temperatures: Number of rungs on the temperature ladder. Ignored if
-      `betas` is given explicitly.
-    betas: Optional explicit, strictly increasing beta ladder from 0 to 1.
-      Overrides `n_temperatures`/`beta_min`.
+      `betas` is given explicitly. `n_temperatures=1` (equivalently, a
+      single-element `betas`) switches to a single-temperature mode: plain
+      NUTS at that one beta (default 1.0, i.e. the true posterior), with no
+      swap proposals and no stepping-stone evidence estimate -- see
+      `swap_every` and the `log_evidence`/`swap_acceptance` return fields.
+    betas: Optional explicit beta ladder. Either a single value in (0, 1]
+      (single-temperature mode, see `n_temperatures`) or a strictly
+      increasing ladder from 0 to 1. Overrides `n_temperatures`/`beta_min`.
     n_chains_per_temperature: Independent chains run per temperature rung.
       NOTE: "shard" mode currently only achieves a real multi-device split
       when this is 1 -- see README "Known Limitations".
     n_warmup, n_samples: Warmup and post-warmup sampling steps per chain.
     beta_min: Smallest positive beta on the ladder (rung 0 is always beta=0).
     swap_every: Attempt adjacent-temperature swaps every this many steps.
+      Ignored in single-temperature mode (`n_temperatures == 1`), which has
+      no adjacent rung to swap with.
     max_num_doublings, target_acceptance_rate, is_mass_matrix_diagonal:
       Forwarded to BlackJAX's NUTS / window adaptation.
     seed: Integer PRNG seed.
@@ -473,15 +480,28 @@ def pt_nuts(
     A `TemperedNUTSResult` with samples (in constrained space), per-rung
     log-likelihoods, the beta ladder, per-rung mean log-likelihood, the
     stepping-stone log evidence estimate, and swap/NUTS acceptance rates.
+    In single-temperature mode (`n_temperatures == 1`), `log_evidence` is
+    NaN (not estimable without a temperature ladder) and `swap_acceptance`
+    is an empty array.
   """
   model_kwargs = model_kwargs or {}
   if betas is None:
-    betas = geometric_temperature_ladder(n_temperatures, beta_min=beta_min)
+    if n_temperatures == 1:
+      betas = jnp.array([1.0])
+    else:
+      betas = geometric_temperature_ladder(n_temperatures, beta_min=beta_min)
   else:
     betas = jnp.asarray(betas)
-    if betas.ndim != 1 or not (jnp.all(betas[:-1] < betas[1:]) and betas[0] == 0 and betas[-1] == 1):
+    if betas.ndim != 1:
+      raise ValueError("betas must be a 1-D array.")
+    if betas.shape[0] == 1:
+      if not (0.0 < float(betas[0]) <= 1.0):
+        raise ValueError("A single-temperature betas array must contain one value in (0, 1].")
+    elif not (jnp.all(betas[:-1] < betas[1:]) and betas[0] == 0 and betas[-1] == 1):
       raise ValueError("betas must be strictly increasing, starting at 0 and ending at 1.")
     n_temperatures = betas.shape[0]
+
+  single_temperature = n_temperatures == 1
 
   ckptr = _Checkpointer(checkpoint_dir, resume=resume)
   total_units = n_chains_per_temperature * n_temperatures
@@ -573,6 +593,12 @@ def pt_nuts(
 
     states, info = batched_step(nuts_keys, states, betas_flat, step_sizes, inv_mass_matrices)
     loglik = batched_loglik(states)
+
+    if single_temperature:
+      # Plain NUTS: no adjacent rungs to swap with, so skip the swap
+      # machinery entirely (including the otherwise-wasted state reinit).
+      no_swap_acc = jnp.zeros((n_chains_per_temperature, 0), dtype=jnp.float32)
+      return states, (states.position, loglik, info.acceptance_rate, no_swap_acc)
 
     do_swap = ((it + 1) % swap_every) == 0
 
@@ -713,11 +739,16 @@ def pt_nuts(
     processed_flat = jax.lax.map(postprocess_fn, flat_samples, batch_size=batch_size)
     samples = jax.tree.map(lambda x: x.reshape(flat_shape[:-1] + x.shape[1:]), processed_flat)
 
-  if verbose:
-    print("Computing stepping stone marginal likelihood estimate...")
-
   loglik_for_evidence = jnp.transpose(loglik_samples, (2, 1, 0))
-  mean_loglik, log_evidence = stepping_stone_integration(betas, loglik_for_evidence)
+  if single_temperature:
+    if verbose:
+      print("Single-temperature run: skipping evidence estimation (no thermodynamic integration).")
+    mean_loglik = jnp.mean(loglik_for_evidence, axis=(0, 2))
+    log_evidence = jnp.asarray(jnp.nan)
+  else:
+    if verbose:
+      print("Computing stepping stone marginal likelihood estimate...")
+    mean_loglik, log_evidence = stepping_stone_integration(betas, loglik_for_evidence)
 
   return TemperedNUTSResult(
       samples=samples,

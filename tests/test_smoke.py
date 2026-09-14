@@ -189,3 +189,25 @@ def test_checkpoint_resume_with_mismatched_settings_raises(tmp_path):
             _gaussian_model, checkpoint_dir=checkpoint_dir, checkpoint_every=4,
             n_samples=8, resume=True, **kw,
         )
+
+
+def test_single_temperature_runs_plain_nuts_without_evidence_or_swaps():
+    """n_temperatures=1 should behave like plain NUTS at beta=1: no swap
+    machinery, no stepping-stone evidence estimate."""
+    kw = dict(COMMON_KW)
+    kw["n_temperatures"] = 1
+    res = pt_nuts(_gaussian_model, **kw)
+    assert res.loglik.shape == (1, 1, 10)
+    assert res.temperatures.shape == (1,)
+    assert float(res.temperatures[0]) == 1.0
+    assert res.swap_acceptance.shape == (0,)
+    assert np.isnan(np.asarray(res.log_evidence))
+    assert np.isfinite(np.asarray(res.mean_loglik)).all()
+
+
+def test_single_temperature_accepts_explicit_beta():
+    kw = dict(COMMON_KW)
+    kw.pop("n_temperatures")
+    res = pt_nuts(_gaussian_model, betas=jnp.array([0.5]), **kw)
+    assert float(res.temperatures[0]) == 0.5
+    assert res.samples["mu"].shape == (1, 1, 10)
