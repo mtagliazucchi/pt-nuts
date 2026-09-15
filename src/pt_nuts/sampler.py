@@ -554,17 +554,27 @@ def pt_nuts(
   if warmup_ckpt is not None:
     if verbose:
       print("Loading warmup from checkpoint...")
+    if "warmup_positions" not in warmup_ckpt:
+      raise ValueError(
+          f"Warmup checkpoint in {checkpoint_dir!r} predates saving the "
+          "post-warmup position (it only has step_sizes/inv_mass_matrices). "
+          "Delete the checkpoint directory and rerun so sampling can be "
+          "seeded from where warmup actually converged, instead of falling "
+          "back to a fresh random initial position."
+      )
     step_sizes = warmup_ckpt["step_sizes"]
     inv_mass_matrices = warmup_ckpt["inv_mass_matrices"]
+    warmup_positions = warmup_ckpt["warmup_positions"]
   else:
     with blackjax.progress_bar(label="Warmup parallel streams"):
-      step_sizes, inv_mass_matrices, _ = warmup_runner(
+      step_sizes, inv_mass_matrices, warmup_positions = warmup_runner(
           lambda args: _warmup_single(args[0], args[1], args[2]),
           (initial_particles, betas_flat, warmup_keys),
       )
     ckptr.save("warmup_checkpoint.pkl", {
         "step_sizes": step_sizes,
         "inv_mass_matrices": inv_mass_matrices,
+        "warmup_positions": warmup_positions,
     })
 
   if verbose and single_temperature:
@@ -589,7 +599,7 @@ def pt_nuts(
   betas_flat = shard_leaf(betas_flat)
   step_sizes = shard_leaf(step_sizes)
   inv_mass_matrices = shard_leaf(inv_mass_matrices)
-  initial_particles = shard_leaf(initial_particles)
+  warmup_positions = shard_leaf(warmup_positions)
 
   def scan_body(states, xs):
     skey, it = xs
@@ -620,7 +630,7 @@ def pt_nuts(
     states, loglik, swap_acc = jax.lax.cond(do_swap, do_swap_fn, no_swap_fn, operand=None)
     return states, (states.position, loglik, info.acceptance_rate, swap_acc)
 
-  states = batched_init(initial_particles, betas_flat)
+  states = batched_init(warmup_positions, betas_flat)
   sample_time_keys = jax.random.split(key_chain, n_samples)
   iter_indices = jnp.arange(n_samples)
 
@@ -677,7 +687,8 @@ def pt_nuts(
 
     pbar = tqdm(total=n_samples, desc="Sampling ladder") if (verbose and tqdm is not None) else None
     if pbar is not None and start_block > 0:
-      pbar.update(int(block_starts[start_block]))
+      done = n_samples if start_block >= n_blocks else int(block_starts[start_block])
+      pbar.update(done)
 
     block_positions, block_loglik, block_accept, block_swap = [], [], [], []
 
