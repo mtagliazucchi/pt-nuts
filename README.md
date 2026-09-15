@@ -1,7 +1,9 @@
 # pt-nuts
 
 Parallel-tempered NUTS sampling for [NumPyro](https://num.pyro.ai/) models,
-built on [BlackJAX](https://blackjax-devs.github.io/blackjax/) and JAX.
+built directly on NumPyro's own HMC/NUTS kernel (`numpyro.infer.hmc`) and
+JAX -- the same warmup/adaptation code `numpyro.infer.MCMC(NUTS(model))`
+uses.
 
 Runs a ladder of NUTS chains at different inverse-temperatures (betas),
 periodically proposes swaps between adjacent temperatures (replica
@@ -68,8 +70,8 @@ print(result.swap_acceptance)       # per-adjacent-pair swap acceptance rate
 
 ## Parallel execution modes
 
-Two independent phases each accept a mode: `warmup_parallel_mode` (BlackJAX
-window adaptation, run once per chain-temperature unit) and
+Two independent phases each accept a mode: `warmup_parallel_mode` (NumPyro's
+NUTS window adaptation, run once per chain-temperature unit) and
 `sampling_parallel_mode` (the main tempered sampling loop). **They are
 independent of each other** — setting one has no effect on the other.
 
@@ -171,7 +173,7 @@ uninterrupted, uncheckpointed `jax.lax.scan` over all `n_samples`.
 ## Requirements
 
 - Python >= 3.10
-- `jax`, `numpyro`, `blackjax[progress]`, `numpy`, `tqdm`
+- `jax`, `numpyro`, `numpy`, `tqdm`, and (optional, for `verbose=True`'s live progress bar) `jax-tap`
 
 ## Development
 

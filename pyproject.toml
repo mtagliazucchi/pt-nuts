@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pt-nuts"
 version = "0.1.0"
-description = "Parallel-tempered NUTS sampling for NumPyro models, built on BlackJAX and JAX."
+description = "Parallel-tempered NUTS sampling for NumPyro models, built directly on NumPyro's own HMC/NUTS kernel and JAX."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -17,7 +17,6 @@ dependencies = [
     "jax>=0.9.0",
     "numpy>=1.25",
     "numpyro>=0.15",
-    "blackjax[progress]>=1.2",
 ]
 
 
@@ -26,10 +25,10 @@ dependencies = [
 # This package intentionally does not pin a jax[...] extra.
 
 [project.optional-dependencies]
-# Needed for verbose=True's live warmup progress bar. The PyPI package name
-# is "jax-tap" (import name "jaxtap") -- do NOT `pip install jaxtap`, that
-# is a different, unrelated (nonexistent) package.
-progress = ["blackjax[progress]"]
+# Needed for verbose=True's live warmup/sampling progress bar. The PyPI
+# package name is "jax-tap" (import name "jaxtap") -- do NOT `pip install
+# jaxtap`, that is a different, unrelated (nonexistent) package.
+progress = ["jax-tap"]
 dev = ["pytest"]
 
 [project.urls]

@@ -1,9 +1,14 @@
-"""Parallel-tempered NUTS sampling on top of BlackJAX + NumPyro.
+"""Parallel-tempered NUTS sampling on top of NumPyro.
 
 Runs a ladder of NUTS chains at different inverse-temperatures (betas) for a
 NumPyro model, with periodic swap proposals between adjacent temperatures
 (replica exchange / parallel tempering), and estimates the log model
 evidence via stepping-stone thermodynamic integration.
+
+Sampling itself is built directly on NumPyro's low-level `hmc()` kernel
+(`numpyro.infer.hmc`), the same engine `numpyro.infer.MCMC`/`NUTS` use, so a
+single-temperature `pt_nuts` run reproduces the warmup/adaptation behavior
+of a plain `numpyro.infer.MCMC(NUTS(model))` run on the same model.
 
 See the package README for parameter semantics, the three parallel
 execution modes ("sequential", "vmap", "shard"), and known limitations.
@@ -21,10 +26,12 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-import blackjax
 import numpyro
+from numpyro.infer.hmc import hmc
 from numpyro.infer.util import initialize_model, constrain_fn
 from numpyro.distributions.transforms import biject_to
+
+from .progress_bar import progress_bar
 
 try:
   from tqdm.auto import tqdm
@@ -235,14 +242,14 @@ def _make_parallel_runner(mode: ParallelMode, batch_size: int = 1, devices: Opti
 
 def _make_sampling_ops(
     mode: ParallelMode,
-    nuts_init,
+    nuts_reinit,
     nuts_step,
     log_likelihood_fn,
     batch_size: int = 1,
     devices: Optional[list] = None,
 ):
-  """Builds (batched_init, batched_step, batched_loglik, shard_leaf) for the
-  main tempered-sampling scan.
+  """Builds (batched_reinit, batched_step, batched_loglik, shard_leaf) for
+  the main tempered-sampling scan.
 
   Unlike warmup, the units here are NOT independent across scan iterations
   (adjacent-temperature swaps couple them every `swap_every` steps), so we
@@ -258,42 +265,51 @@ def _make_sampling_ops(
       *before* the outer jax.lax.scan starts, so XLA's SPMD partitioner
       spreads the whole compiled scan program across `devices`. This shard
       placement is applied here regardless of what warmup_parallel_mode did.
+
+  `nuts_step(state, beta)` advances one NUTS step; the numpyro `HMCState`
+  carries and evolves its own rng_key internally, so no external per-step
+  key needs to be threaded in here (unlike BlackJAX's stateless kernel.step).
+  `nuts_reinit(state, position, beta)` is only used after a temperature
+  swap: it recomputes the position-dependent fields of `state` (z, z_grad,
+  potential_energy) for the swapped-in position, while preserving that
+  slot's already-adapted `state.adapt_state` (step_size/inverse_mass_matrix)
+  untouched.
   """
 
-  def _init_single(args):
-    position, beta = args
-    return nuts_init(position, beta)
+  def _reinit_single(args):
+    state, position, beta = args
+    return nuts_reinit(state, position, beta)
 
   def _step_single(args):
-    rng_key, state, beta, step_size, inv_mass_matrix = args
-    return nuts_step(rng_key, state, beta, step_size, inv_mass_matrix)
+    state, beta = args
+    return nuts_step(state, beta)
 
   def _loglik_single(state):
-    return log_likelihood_fn(state.position)
+    return log_likelihood_fn(state.z)
 
   if mode == "sequential":
-    def batched_init(position, beta):
-      return jax.lax.map(_init_single, (position, beta), batch_size=1)
+    def batched_reinit(state, position, beta):
+      return jax.lax.map(_reinit_single, (state, position, beta), batch_size=1)
 
-    def batched_step(rng_key, state, beta, step_size, inv_mass_matrix):
-      return jax.lax.map(_step_single, (rng_key, state, beta, step_size, inv_mass_matrix), batch_size=1)
+    def batched_step(state, beta):
+      return jax.lax.map(_step_single, (state, beta), batch_size=1)
 
     def batched_loglik(state):
       return jax.lax.map(_loglik_single, state, batch_size=1)
 
-    return batched_init, batched_step, batched_loglik, (lambda x: x)
+    return batched_reinit, batched_step, batched_loglik, (lambda x: x)
 
   if mode == "vmap":
-    def batched_init(position, beta):
-      return jax.lax.map(_init_single, (position, beta), batch_size=batch_size)
+    def batched_reinit(state, position, beta):
+      return jax.lax.map(_reinit_single, (state, position, beta), batch_size=batch_size)
 
-    def batched_step(rng_key, state, beta, step_size, inv_mass_matrix):
-      return jax.lax.map(_step_single, (rng_key, state, beta, step_size, inv_mass_matrix), batch_size=batch_size)
+    def batched_step(state, beta):
+      return jax.lax.map(_step_single, (state, beta), batch_size=batch_size)
 
     def batched_loglik(state):
       return jax.lax.map(_loglik_single, state, batch_size=batch_size)
 
-    return batched_init, batched_step, batched_loglik, (lambda x: x)
+    return batched_reinit, batched_step, batched_loglik, (lambda x: x)
 
   if mode == "shard":
     devs = list(devices) if devices is not None else jax.devices()
@@ -302,11 +318,11 @@ def _make_sampling_ops(
     sharding = NamedSharding(mesh, P("shard"))
     shard_leaf = _make_shard_leaf_fn(n_devices, sharding)
 
-    batched_init = jax.vmap(nuts_init, in_axes=(0, 0))
-    batched_step = jax.vmap(nuts_step, in_axes=(0, 0, 0, 0, 0))
-    batched_loglik = jax.vmap(lambda s: log_likelihood_fn(s.position))
+    batched_reinit = jax.vmap(nuts_reinit, in_axes=(0, 0, 0))
+    batched_step = jax.vmap(nuts_step, in_axes=(0, 0))
+    batched_loglik = jax.vmap(lambda s: log_likelihood_fn(s.z))
 
-    return batched_init, batched_step, batched_loglik, shard_leaf
+    return batched_reinit, batched_step, batched_loglik, shard_leaf
 
   raise ValueError(f"Unknown parallel mode {mode!r}; choose 'sequential', 'vmap', or 'shard'.")
 
@@ -426,14 +442,17 @@ def pt_nuts(
       Ignored in single-temperature mode (`n_temperatures == 1`), which has
       no adjacent rung to swap with.
     max_num_doublings, target_acceptance_rate, is_mass_matrix_diagonal:
-      Forwarded to BlackJAX's NUTS / window adaptation.
+      Forwarded to NumPyro's NUTS as `max_tree_depth`, `target_accept_prob`,
+      and `dense_mass=not is_mass_matrix_diagonal` respectively -- the same
+      warmup/adaptation code `numpyro.infer.MCMC(NUTS(model))` uses, so a
+      single-temperature (`n_temperatures=1`) run reproduces that warmup.
     seed: Integer PRNG seed.
-    verbose: Print progress. Uses `blackjax.progress_bar` for warmup and,
+    verbose: Print progress. Uses `pt_nuts.progress_bar` for warmup and,
       when `checkpoint_dir` is None, for the main sampling loop as well
       (both wrap a `jax.lax.scan` and report real incremental progress).
-      This requires the optional `blackjax[progress]` extra (PyPI package
-      `jax-tap`, imported as `jaxtap`) -- NOT `pip install jaxtap`, which
-      does not exist. Without it, `verbose=True` raises ImportError. When
+      This requires the optional `jax-tap` package (imported as `jaxtap`)
+      -- NOT `pip install jaxtap`, which does not exist; the PyPI package
+      is `jax-tap`. Without it, `verbose=True` raises ImportError. When
       `checkpoint_dir` is set, sampling instead uses a plain `tqdm` bar
       that advances once per checkpointed block (see `checkpoint_every`);
       with the default `checkpoint_every=1` this is still per-sample.
@@ -530,23 +549,59 @@ def pt_nuts(
   def tempered_logdensity(position, beta):
     return log_prior_fn(position) + beta * log_likelihood_fn(position)
 
+  def potential_fn_gen(beta):
+    def potential_fn(position):
+      return -tempered_logdensity(position, beta)
+    return potential_fn
+
+  # A single hmc() instance is shared by every unit's warmup and sampling
+  # call: hmc() stores the NUTS/warmup configuration (num_warmup, tree
+  # depth, ...) in nonlocal closure state set by the first init_kernel()
+  # call, and every unit uses the same n_warmup/max_num_doublings, so this
+  # is safe to share -- see numpyro.infer.hmc.hmc's docstring. sample_kernel
+  # self-adapts while state.i < num_warmup and freezes automatically past
+  # it, so the same function drives both warmup and post-warmup sampling.
+  init_kernel, sample_kernel = hmc(potential_fn_gen=potential_fn_gen, algo="NUTS")
+
+  # init_kernel is what actually populates that nonlocal state (a plain
+  # Python-level side effect of tracing it, independent of the position it
+  # is traced with); sample_kernel reads it unconditionally (e.g. `state.i
+  # < wa_steps`) and crashes with a confusing TypeError if it was never
+  # set. Below, the "load warmup from checkpoint" branch skips
+  # _warmup_single (hence init_kernel) entirely, so prime it here,
+  # unconditionally, before that branch -- the returned state is discarded,
+  # only the config-only (position-independent) side effect matters. This
+  # is a no-op duplicate of what _warmup_single's own init_kernel call does
+  # in the "compute fresh warmup" branch below.
+  init_kernel(
+      initial_particles[0], num_warmup=n_warmup,
+      target_accept_prob=target_acceptance_rate,
+      dense_mass=not is_mass_matrix_diagonal,
+      max_tree_depth=max_num_doublings,
+      model_args=(betas_flat[0],), rng_key=key_warmup,
+  )
+
   if verbose:
     print(f"Running window adaptation for {n_warmup} steps per stream (parallel_mode={warmup_parallel_mode!r})...")
 
   warmup_keys = jax.random.split(key_warmup, total_units)
 
   def _warmup_single(position, beta, key):
-    def logdensity_fn(p):
-      return tempered_logdensity(p, beta)
-    adaptation = blackjax.window_adaptation(
-        blackjax.nuts,
-        logdensity_fn,
-        is_mass_matrix_diagonal=is_mass_matrix_diagonal,
-        target_acceptance_rate=target_acceptance_rate,
-        max_num_doublings=max_num_doublings,
+    state = init_kernel(
+        position,
+        num_warmup=n_warmup,
+        target_accept_prob=target_acceptance_rate,
+        dense_mass=not is_mass_matrix_diagonal,
+        max_tree_depth=max_num_doublings,
+        model_args=(beta,),
+        rng_key=key,
     )
-    (last_state, parameters), _ = adaptation.run(key, position, n_warmup)
-    return parameters["step_size"], parameters["inverse_mass_matrix"], last_state.position
+
+    def body(s, _):
+      return sample_kernel(s, model_args=(beta,)), None
+
+    state, _ = jax.lax.scan(body, state, None, length=n_warmup)
+    return state
 
   warmup_runner = _make_parallel_runner(warmup_parallel_mode, batch_size=batch_size, devices=devices)
   warmup_ckpt = ckptr.load("warmup_checkpoint.pkl")
@@ -554,83 +609,78 @@ def pt_nuts(
   if warmup_ckpt is not None:
     if verbose:
       print("Loading warmup from checkpoint...")
-    if "warmup_positions" not in warmup_ckpt:
+    if "warmup_state" not in warmup_ckpt:
       raise ValueError(
           f"Warmup checkpoint in {checkpoint_dir!r} predates saving the "
-          "post-warmup position (it only has step_sizes/inv_mass_matrices). "
-          "Delete the checkpoint directory and rerun so sampling can be "
-          "seeded from where warmup actually converged, instead of falling "
-          "back to a fresh random initial position."
+          "full post-warmup HMCState. Delete the checkpoint directory and "
+          "rerun with this version of pt_nuts."
       )
-    step_sizes = warmup_ckpt["step_sizes"]
-    inv_mass_matrices = warmup_ckpt["inv_mass_matrices"]
-    warmup_positions = warmup_ckpt["warmup_positions"]
+    warmup_states = warmup_ckpt["warmup_state"]
   else:
-    with blackjax.progress_bar(label="Warmup parallel streams"):
-      step_sizes, inv_mass_matrices, warmup_positions = warmup_runner(
+    with progress_bar(label="Warmup parallel streams"):
+      warmup_states = warmup_runner(
           lambda args: _warmup_single(args[0], args[1], args[2]),
           (initial_particles, betas_flat, warmup_keys),
       )
-    ckptr.save("warmup_checkpoint.pkl", {
-        "step_sizes": step_sizes,
-        "inv_mass_matrices": inv_mass_matrices,
-        "warmup_positions": warmup_positions,
-    })
+    ckptr.save("warmup_checkpoint.pkl", {"warmup_state": warmup_states})
 
   if verbose and single_temperature:
-    print(f"Warmup finished. Initial step size found: {np.asarray(step_sizes).squeeze()}")
+    print(f"Warmup finished. Initial step size found: {np.asarray(warmup_states.adapt_state.step_size).squeeze()}")
 
-  def nuts_step(rng_key, state, beta, step_size, inv_mass_matrix):
-    logdensity_fn = lambda p: tempered_logdensity(p, beta)
-    kernel = blackjax.nuts(logdensity_fn, step_size, inv_mass_matrix, max_num_doublings=max_num_doublings)
-    return kernel.step(rng_key, state)
+  def nuts_step(state, beta):
+    return sample_kernel(state, model_args=(beta,))
 
-  def nuts_init(position, beta):
-    def logdensity_fn(p):
-      return tempered_logdensity(p, beta)
-    return blackjax.nuts.init(position, logdensity_fn)
+  def nuts_reinit(state, position, beta):
+    # Only used right after a temperature swap: recompute the
+    # position-dependent fields for the swapped-in position while keeping
+    # this slot's already-adapted state.adapt_state (step_size,
+    # inverse_mass_matrix, ...) and state.i (so adaptation stays frozen)
+    # untouched -- mirrors what blackjax.nuts.init(position, ...) did, but
+    # without discarding the adaptation results as blackjax's did.
+    pe_fn = potential_fn_gen(beta)
+    potential_energy, z_grad = jax.value_and_grad(pe_fn)(position)
+    return state._replace(
+        z=position, z_grad=z_grad, potential_energy=potential_energy,
+        energy=potential_energy, r=None,
+    )
 
-  batched_init, batched_step, batched_loglik, shard_leaf = _make_sampling_ops(
+  batched_reinit, batched_step, batched_loglik, shard_leaf = _make_sampling_ops(
       sampling_parallel_mode,
-      nuts_init, nuts_step, log_likelihood_fn,
+      nuts_reinit, nuts_step, log_likelihood_fn,
       batch_size=batch_size, devices=devices,
   )
 
-  betas_flat = shard_leaf(betas_flat)
-  step_sizes = shard_leaf(step_sizes)
-  inv_mass_matrices = shard_leaf(inv_mass_matrices)
-  warmup_positions = shard_leaf(warmup_positions)
+  betas_flat = jax.tree.map(shard_leaf, betas_flat)
+  states = jax.tree.map(shard_leaf, warmup_states)
 
   def scan_body(states, xs):
-    skey, it = xs
-    key_nuts, key_swap = jax.random.split(skey)
-    nuts_keys = jax.random.split(key_nuts, total_units)
+    key_swap, it = xs
 
-    states, info = batched_step(nuts_keys, states, betas_flat, step_sizes, inv_mass_matrices)
+    states = batched_step(states, betas_flat)
     loglik = batched_loglik(states)
+    accept_rate = states.accept_prob
 
     if single_temperature:
       # Plain NUTS: no adjacent rungs to swap with, so skip the swap
       # machinery entirely (including the otherwise-wasted state reinit).
       no_swap_acc = jnp.zeros((n_chains_per_temperature, 0), dtype=jnp.float32)
-      return states, (states.position, loglik, info.acceptance_rate, no_swap_acc)
+      return states, (states.z, loglik, accept_rate, no_swap_acc)
 
     do_swap = ((it + 1) % swap_every) == 0
 
     def do_swap_fn(_):
       new_positions, new_loglik, swap_acc = _swap_adjacent_positions(
-          states.position, loglik, betas, key_swap, it % 2, n_chains_per_temperature, n_temperatures
+          states.z, loglik, betas, key_swap, it % 2, n_chains_per_temperature, n_temperatures
       )
-      new_states = batched_init(new_positions, betas_flat)
+      new_states = batched_reinit(states, new_positions, betas_flat)
       return new_states, new_loglik, swap_acc
 
     def no_swap_fn(_):
       return states, loglik, jnp.zeros((n_chains_per_temperature, n_temperatures - 1), dtype=jnp.float32)
 
     states, loglik, swap_acc = jax.lax.cond(do_swap, do_swap_fn, no_swap_fn, operand=None)
-    return states, (states.position, loglik, info.acceptance_rate, swap_acc)
+    return states, (states.z, loglik, accept_rate, swap_acc)
 
-  states = batched_init(warmup_positions, betas_flat)
   sample_time_keys = jax.random.split(key_chain, n_samples)
   iter_indices = jnp.arange(n_samples)
 
@@ -641,7 +691,7 @@ def pt_nuts(
   if checkpoint_dir is None:
 
     if verbose:
-      with blackjax.progress_bar(label="Sampling ladder"):
+      with progress_bar(label="Sampling ladder"):
         _, (positions_seq, loglik_seq, accept_seq, swap_seq) = jax.lax.scan(
             scan_body, states, (sample_time_keys, iter_indices)
         )
