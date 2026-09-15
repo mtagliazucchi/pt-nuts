@@ -428,13 +428,15 @@ def pt_nuts(
     max_num_doublings, target_acceptance_rate, is_mass_matrix_diagonal:
       Forwarded to BlackJAX's NUTS / window adaptation.
     seed: Integer PRNG seed.
-    verbose: Print progress. Uses `blackjax.progress_bar` for warmup, which
-      requires the optional `blackjax[progress]` extra (PyPI package
+    verbose: Print progress. Uses `blackjax.progress_bar` for warmup and,
+      when `checkpoint_dir` is None, for the main sampling loop as well
+      (both wrap a `jax.lax.scan` and report real incremental progress).
+      This requires the optional `blackjax[progress]` extra (PyPI package
       `jax-tap`, imported as `jaxtap`) -- NOT `pip install jaxtap`, which
-      does not exist. Without it, `verbose=True` raises ImportError. The
-      sampling-phase progress bar is not incremental: because the whole
-      sampling loop is a single compiled `jax.lax.scan`, it reports 0%
-      until the run finishes, then jumps to 100%.
+      does not exist. Without it, `verbose=True` raises ImportError. When
+      `checkpoint_dir` is set, sampling instead uses a plain `tqdm` bar
+      that advances once per checkpointed block (see `checkpoint_every`);
+      with the default `checkpoint_every=1` this is still per-sample.
     checkpoint_dir: If set, enables checkpointing to this directory:
       (1) warmup results (step sizes, inverse mass matrices) are saved once
       after warmup completes and reloaded on a subsequent call with
@@ -565,6 +567,9 @@ def pt_nuts(
         "inv_mass_matrices": inv_mass_matrices,
     })
 
+  if verbose and single_temperature:
+    print(f"Warmup finished. Initial step size found: {np.asarray(step_sizes).squeeze()}")
+
   def nuts_step(rng_key, state, beta, step_size, inv_mass_matrix):
     logdensity_fn = lambda p: tempered_logdensity(p, beta)
     kernel = blackjax.nuts(logdensity_fn, step_size, inv_mass_matrix, max_num_doublings=max_num_doublings)
@@ -625,16 +630,17 @@ def pt_nuts(
 
   if checkpoint_dir is None:
 
-    pbar = tqdm(total=n_samples, desc="Sampling ladder") if (verbose and tqdm is not None) else None
-
-    _, (positions_seq, loglik_seq, accept_seq, swap_seq) = jax.lax.scan(
-        scan_body, states, (sample_time_keys, iter_indices)
-    )
-    jax.block_until_ready(loglik_seq)
-
-    if pbar is not None:
-      pbar.update(n_samples)
-      pbar.close()
+    if verbose:
+      with blackjax.progress_bar(label="Sampling ladder"):
+        _, (positions_seq, loglik_seq, accept_seq, swap_seq) = jax.lax.scan(
+            scan_body, states, (sample_time_keys, iter_indices)
+        )
+        jax.block_until_ready(loglik_seq)
+    else:
+      _, (positions_seq, loglik_seq, accept_seq, swap_seq) = jax.lax.scan(
+          scan_body, states, (sample_time_keys, iter_indices)
+      )
+      jax.block_until_ready(loglik_seq)
 
   else:
     block_size = max(1, min(checkpoint_every, n_samples))
